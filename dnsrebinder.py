@@ -2,7 +2,11 @@
 # coding=utf-8
 
 import argparse
+import random
+import atexit
 import datetime
+import signal
+import subprocess
 import sys
 import time
 import threading
@@ -46,7 +50,57 @@ class DomainName(str):
 # }
 
 
-def dns_response(data, domain, ip, rebind, ttl, counterMax, hostCounter):
+RESOLVED_SERVICE = "systemd-resolved"
+
+# Tracks whether *we* stopped systemd-resolved, so we only restart it on exit
+# if we were the ones who stopped it.
+_resolved_stopped = {"value": False}
+
+
+def _systemctl(action):
+    """Run `systemctl <action> systemd-resolved`, returning the CompletedProcess
+    or None if systemctl is not available."""
+    try:
+        return subprocess.run(
+            ["systemctl", action, RESOLVED_SERVICE],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        return None
+
+
+def resolved_is_active():
+    r = _systemctl("is-active")
+    return r is not None and r.stdout.strip() == "active"
+
+
+def stop_resolved():
+    """Stop systemd-resolved so we can bind port 53. Only acts if it is running."""
+    if not resolved_is_active():
+        return
+    print("Stopping %s so we can use port 53..." % RESOLVED_SERVICE)
+    r = _systemctl("stop")
+    if r is not None and r.returncode == 0:
+        _resolved_stopped["value"] = True
+    else:
+        err = (r.stderr.strip() if r is not None else "systemctl not found")
+        print("Warning: could not stop %s: %s" % (RESOLVED_SERVICE, err))
+        print("You probably need to run this as root (sudo).")
+
+
+def start_resolved():
+    """Restart systemd-resolved, but only if we were the ones who stopped it.
+    Safe to call more than once (finally block + atexit + signal handler)."""
+    if not _resolved_stopped["value"]:
+        return
+    _resolved_stopped["value"] = False
+    print("Restarting %s..." % RESOLVED_SERVICE)
+    r = _systemctl("restart")
+    if r is None or r.returncode != 0:
+        err = (r.stderr.strip() if r is not None else "systemctl not found")
+        print("Warning: could not restart %s: %s" % (RESOLVED_SERVICE, err))
+
+
+def dns_response(data, domain, ip, rebind, ttl, counterMax, hostCounter, flip, sleep, lock, resetAfter, lastSeen, randomMode):
     request = DNSRecord.parse(data)
 
     # print(request)
@@ -57,7 +111,7 @@ def dns_response(data, domain, ip, rebind, ttl, counterMax, hostCounter):
     qn = str(qname)
     qtype = request.q.qtype
     qt = QTYPE[qtype]
-    
+
     if qn == domain or qn.endswith('.' + domain):
 
 
@@ -65,18 +119,35 @@ def dns_response(data, domain, ip, rebind, ttl, counterMax, hostCounter):
         rqt = "A"
         if qt in ['*', rqt]:
             print("Got a request for " + str(qname) + " Type: " + str(qt))
-            if qn in hostCounter:
-                if hostCounter[qn] < counterMax:
-                    reply.add_answer(RR(rname=qname, rtype=getattr(QTYPE, rqt), rclass=1, ttl=ttl, rdata=A(ip)))
-                else:
-                    reply.add_answer(RR(rname=qname, rtype=getattr(QTYPE, rqt), rclass=1, ttl=ttl, rdata=A(rebind)))
 
-                hostCounter[qn] = hostCounter[qn] + 1 
-                print("------------------------ Counter for host ", qn, " ", hostCounter[qn])
-            else:
-                reply.add_answer(RR(rname=qname, rtype=getattr(QTYPE, rqt), rclass=1, ttl=ttl, rdata=A(ip)))
-                hostCounter[qn] = 1
-                print("------------------------ Counter for host ", qn, " ", hostCounter[qn])
+            # Optional delay before answering each query.
+            if sleep > 0:
+                time.sleep(sleep)
+
+            # Pick the address to answer with. Guard shared state with a lock
+            # because the threading servers handle each query in its own thread.
+            with lock:
+                # Auto-reset a host's state after a period of inactivity, so each
+                # fresh burst of queries (e.g. a new precheck+fetch attempt)
+                # starts over from the first answer (--ip) again.
+                if resetAfter > 0 and qn in lastSeen and (time.time() - lastSeen[qn]) > resetAfter:
+                    hostCounter[qn] = 0
+                lastSeen[qn] = time.time()
+
+                count = hostCounter.get(qn, 0)
+                if randomMode:
+                    answer_ip = random.choice([ip, rebind])
+                elif flip:
+                    # Alternate between the two IPs on every single query.
+                    answer_ip = ip if count % 2 == 0 else rebind
+                else:
+                    # Original behaviour: first counterMax queries get ip,
+                    # everything afterwards gets rebind (one-way flip).
+                    answer_ip = ip if count < counterMax else rebind
+                hostCounter[qn] = count + 1
+
+            reply.add_answer(RR(rname=qname, rtype=getattr(QTYPE, rqt), rclass=1, ttl=ttl, rdata=A(answer_ip)))
+            print("------------------------ Host ", qn, " query #", hostCounter[qn], " -> ", answer_ip)
 
 #        for name, rrs in records.items():
 #            if name == qn:
@@ -113,7 +184,7 @@ class BaseRequestHandler(socketserver.BaseRequestHandler):
         try:
             data = self.get_data()
         #   print(len(data), data)  # repr(data).replace('\\x', '')[1:-1]
-            self.send_data(dns_response(data, self.server.domain, self.server.ip, self.server.rebind, self.server.ttl, self.server.counterMax, self.server.hostCounter))
+            self.send_data(dns_response(data, self.server.domain, self.server.ip, self.server.rebind, self.server.ttl, self.server.counterMax, self.server.hostCounter, self.server.flip, self.server.sleep, self.server.lock, self.server.resetAfter, self.server.lastSeen, self.server.randomMode))
         except Exception:
             traceback.print_exc(file=sys.stderr)
 
@@ -154,10 +225,23 @@ def main():
     parser.add_argument('--bind', default='', type=str, help='IP Adress for server to listen on')
     parser.add_argument('--ip', default='8.8.8.8', help='IP Adress used to respond')
     parser.add_argument('--rebind', default='127.0.0.1', help='IP address for rebind')
-    parser.add_argument('--counter', default=2, type=int, help='Number of requests before rebinding'), 
+    parser.add_argument('--counter', default=2, type=int, help='Number of requests before rebinding (ignored when --flip is set)')
+    parser.add_argument('--flip', action='store_true', help='Constantly alternate between --ip and --rebind on every query')
+    parser.add_argument('--random', dest='randomMode', action='store_true', help='Answer each query independently 50/50 between --ip and --rebind (robust to query storms)')
+    parser.add_argument('--sleep', default=0, type=float, help='Seconds to wait before answering each query (e.g. 1 or 2)')
+    parser.add_argument('--reset-after', default=0, type=float, help='Reset a host back to the first answer (--ip) after this many seconds of inactivity, so repeated attempts work without a restart')
+    parser.add_argument('--no-resolved', action='store_true', help="Don't automatically stop/start systemd-resolved (port 53 only)")
 
     args = parser.parse_args()
     if not (args.udp or args.tcp): parser.error("Please select at least one of --udp or --tcp.")
+
+    # Only systemd-resolved on port 53 conflicts with us; manage it automatically
+    # unless the user opted out. Restart it again on exit / interrupt / SIGTERM.
+    manage_resolved = (not args.no_resolved) and sys.platform.startswith("linux") and args.port == 53
+    if manage_resolved:
+        atexit.register(start_resolved)
+        signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+        stop_resolved()
 
     print("Starting nameserver...")
 
@@ -172,7 +256,13 @@ def main():
         s.rebind = args.rebind
         s.ttl = args.ttl
         s.counterMax = args.counter
+        s.flip = args.flip
+        s.sleep = args.sleep
+        s.resetAfter = args.reset_after
+        s.randomMode = args.randomMode
         s.hostCounter = {}
+        s.lastSeen = {}
+        s.lock = threading.Lock()
         thread = threading.Thread(target=s.serve_forever)  # that thread will start one more thread for each request
         thread.daemon = True  # exit the server thread when the main thread terminates
         thread.start()
@@ -189,6 +279,7 @@ def main():
     finally:
         for s in servers:
             s.shutdown()
+        start_resolved()
 
 if __name__ == '__main__':
     main()
